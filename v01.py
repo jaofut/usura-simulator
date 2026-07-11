@@ -1,9 +1,19 @@
 import os
+import io
 from datetime import date
 import pandas as pd
 import streamlit as st
 
-ARQUIVO_EXCEL = "emprestimos.xlsx"
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+    GSHEETS_DISPONIVEL = True
+except ImportError:
+    GSHEETS_DISPONIVEL = False
+
+# Configurações do Google Sheets
+NOME_PLANILHA_GSHEETS = "Gerenciador de Empréstimos - Usura Simulator"
+NOME_ABA_GSHEETS = "emprestimos"
 
 COLUNAS = [
     "ID",
@@ -53,11 +63,134 @@ def _migrar_linha_antiga(row) -> dict:
     }
 
 
-def carregar_dados() -> pd.DataFrame:
-    if not os.path.exists(ARQUIVO_EXCEL):
-        return pd.DataFrame(columns=COLUNAS)
+def conectar_worksheet_gsheets():
+    """Conecta ao Google Sheets usando credenciais (Service Account via st.secrets ou arquivo local)
+    e retorna (worksheet, mensagem_status)."""
+    if not GSHEETS_DISPONIVEL:
+        return None, "Bibliotecas gspread/google-auth não estão instaladas. Execute: pip install gspread google-auth"
 
-    df = pd.read_excel(ARQUIVO_EXCEL)
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+    creds = None
+    origem_creds = ""
+
+    # 1. Tenta carregar do st.secrets
+    try:
+        if hasattr(st, "secrets") and st.secrets:
+            if "gcp_service_account" in st.secrets:
+                creds_dict = dict(st.secrets["gcp_service_account"])
+                creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+                origem_creds = "st.secrets (gcp_service_account)"
+            elif "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
+                cfg = st.secrets["connections"]["gsheets"]
+                if "client_email" in cfg and "private_key" in cfg:
+                    creds_dict = dict(cfg)
+                    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+                    origem_creds = "st.secrets (connections.gsheets)"
+    except Exception:
+        pass
+
+    # 2. Se não achou no secrets, tenta arquivos locais JSON
+    if creds is None:
+        arquivos_candidatos = ["credentials.json", "service_account.json", "gsheets_credentials.json"]
+        for arq in arquivos_candidatos:
+            if os.path.exists(arq):
+                try:
+                    creds = Credentials.from_service_account_file(arq, scopes=scopes)
+                    origem_creds = f"arquivo local ({arq})"
+                    break
+                except Exception:
+                    continue
+
+    if creds is None:
+        return None, "Nenhuma credencial (Service Account JSON) encontrada no st.secrets ou arquivo credentials.json local."
+
+    try:
+        client = gspread.authorize(creds)
+    except Exception as e:
+        return None, f"Erro na autenticação com o Google: {str(e)}"
+
+    # Identifica a planilha alvo (por URL, ID ou Título)
+    spreadsheet_alvo = NOME_PLANILHA_GSHEETS
+    try:
+        if hasattr(st, "secrets") and st.secrets:
+            if "spreadsheet_url" in st.secrets:
+                spreadsheet_alvo = st.secrets["spreadsheet_url"]
+            elif "connections" in st.secrets and "gsheets" in st.secrets["connections"] and "spreadsheet" in st.secrets["connections"]["gsheets"]:
+                spreadsheet_alvo = st.secrets["connections"]["gsheets"]["spreadsheet"]
+    except Exception:
+        pass
+
+    sh = None
+    try:
+        if spreadsheet_alvo.startswith("https://"):
+            sh = client.open_by_url(spreadsheet_alvo)
+        elif "/" not in spreadsheet_alvo and " " not in spreadsheet_alvo and len(spreadsheet_alvo) > 35:
+            sh = client.open_by_key(spreadsheet_alvo)
+        else:
+            sh = client.open(spreadsheet_alvo)
+    except gspread.exceptions.SpreadsheetNotFound:
+        try:
+            sh = client.create(spreadsheet_alvo)
+        except Exception as e_create:
+            return None, f"Planilha '{spreadsheet_alvo}' não encontrada e falha ao criá-la: {str(e_create)}. Verifique se compartilhou a planilha com: {getattr(creds, 'service_account_email', 'sua Service Account')}."
+    except Exception as e_open:
+        return None, f"Erro ao abrir a planilha '{spreadsheet_alvo}': {str(e_open)}"
+
+    try:
+        worksheet = sh.worksheet(NOME_ABA_GSHEETS)
+    except gspread.exceptions.WorksheetNotFound:
+        try:
+            primeira_aba = sh.get_worksheet(0)
+            if primeira_aba and primeira_aba.title in ["Página1", "Sheet1", "Página 1", "Sheet 1"] and primeira_aba.get_all_values() == []:
+                primeira_aba.update_title(NOME_ABA_GSHEETS)
+                worksheet = primeira_aba
+            else:
+                worksheet = sh.add_worksheet(title=NOME_ABA_GSHEETS, rows=1000, cols=25)
+        except Exception as e_ws:
+            return None, f"Erro ao acessar ou criar a aba '{NOME_ABA_GSHEETS}': {str(e_ws)}"
+
+    return worksheet, f"Conectado via {origem_creds} — Planilha: {sh.title}"
+
+
+@st.cache_data(ttl=30, show_spinner="Carregando dados do Google Sheets...")
+def _ler_dados_gsheets() -> list:
+    worksheet, erro = conectar_worksheet_gsheets()
+    if worksheet is None:
+        return []
+    try:
+        return worksheet.get_all_records()
+    except Exception:
+        return []
+
+
+def carregar_dados() -> pd.DataFrame:
+    worksheet, msg = conectar_worksheet_gsheets()
+    if worksheet is None:
+        if "aviso_gsheets_mostrado" not in st.session_state:
+            st.warning(f"☁️ Google Sheets não conectado: {msg}")
+            st.info(
+                "💡 **Como conectar ao Google Sheets:**\n"
+                "1. Baixe o JSON da sua Service Account no Google Cloud Console e salve como **`credentials.json`** nesta pasta (`usura simulator/`) OU configure no `.streamlit/secrets.toml`.\n"
+                "2. Crie a planilha no Google Drive chamada **`Gerenciador de Empréstimos - Usura Simulator`** e **compartilhe como Editor** com o e-mail (`client_email`) do JSON.\n"
+                "*(Enquanto a conexão não estiver ativa, os dados são armazenados temporariamente na memória da sessão)*"
+            )
+            st.session_state["aviso_gsheets_mostrado"] = True
+        
+        if "df_memoria_gsheets" in st.session_state:
+            df = st.session_state["df_memoria_gsheets"].copy()
+        else:
+            df = pd.DataFrame(columns=COLUNAS)
+    else:
+        records = _ler_dados_gsheets()
+        if not records:
+            df = pd.DataFrame(columns=COLUNAS)
+        else:
+            df = pd.DataFrame(records)
+        st.session_state["df_memoria_gsheets"] = df.copy()
 
     for col in ["Data_Emprestimo", "Data_Vencimento", "Data_Base_Juros", "Data_Ultimo_Pagamento"]:
         if col not in df.columns:
@@ -80,17 +213,75 @@ def carregar_dados() -> pd.DataFrame:
                 df.at[idx, col] = val
 
     for col in ["Saldo_Principal", "Juros_Travados", "Valor_Pago_Total"]:
-        df[col] = df[col].fillna(0.0)
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+    if "ID" in df.columns:
+        df["ID"] = pd.to_numeric(df["ID"], errors="coerce").fillna(0).astype(int)
+    if "Valor" in df.columns:
+        df["Valor"] = pd.to_numeric(df["Valor"], errors="coerce").fillna(0.0)
+    if "Taxa_Mensal (%)" in df.columns:
+        df["Taxa_Mensal (%)"] = pd.to_numeric(df["Taxa_Mensal (%)"], errors="coerce").fillna(0.0)
 
     for col in COLUNAS:
         if col not in df.columns:
             df[col] = None
 
-    return df
+    return df[COLUNAS]
 
 
 def salvar_dados(df: pd.DataFrame) -> None:
-    df.to_excel(ARQUIVO_EXCEL, index=False)
+    st.session_state["df_memoria_gsheets"] = df.copy()
+    
+    worksheet, msg = conectar_worksheet_gsheets()
+    if worksheet is None:
+        st.error(f"❌ Não foi possível salvar na planilha do Google Sheets ({msg}). Dados retidos em memória na sessão.")
+        return
+
+    df_salvar = df[COLUNAS].copy()
+
+    # Formata datas para string YYYY-MM-DD
+    for col in ["Data_Emprestimo", "Data_Vencimento", "Data_Base_Juros", "Data_Ultimo_Pagamento"]:
+        if col in df_salvar.columns:
+            df_salvar[col] = df_salvar[col].apply(
+                lambda x: x.strftime("%Y-%m-%d") if pd.notna(x) and isinstance(x, (pd.Timestamp, date)) else ""
+            )
+
+    # Trata nulos em colunas numéricas
+    for col in ["Valor", "Taxa_Mensal (%)", "Saldo_Principal", "Juros_Travados", "Valor_Pago_Total"]:
+        if col in df_salvar.columns:
+            df_salvar[col] = pd.to_numeric(df_salvar[col], errors="coerce").fillna(0.0)
+
+    if "ID" in df_salvar.columns:
+        df_salvar["ID"] = pd.to_numeric(df_salvar["ID"], errors="coerce").fillna(0).astype(int)
+
+    # Preenche o restante com strings vazias
+    df_salvar = df_salvar.fillna("")
+
+    rows_data = []
+    for _, row in df_salvar.iterrows():
+        linha_pronta = []
+        for col in COLUNAS:
+            val = row[col]
+            if pd.isna(val) or val is None or str(val) in ("nan", "None", "<NA>"):
+                val = ""
+            elif isinstance(val, (int, float)):
+                val = float(val) if isinstance(val, float) else int(val)
+            else:
+                val = str(val)
+            linha_pronta.append(val)
+        rows_data.append(linha_pronta)
+
+    table_data = [COLUNAS] + rows_data
+
+    try:
+        worksheet.clear()
+        try:
+            worksheet.update(values=table_data, range_name="A1", value_input_option="USER_ENTERED")
+        except TypeError:
+            worksheet.update("A1", table_data, value_input_option="USER_ENTERED")
+        _ler_dados_gsheets.clear()
+    except Exception as e:
+        st.error(f"❌ Erro ao atualizar o Google Sheets: {str(e)}")
 
 
 def proximo_id(df: pd.DataFrame) -> int:
@@ -296,12 +487,38 @@ with aba_lista:
         m2.metric("Total ainda a receber (todos)", f"R$ {total_devido:,.2f}")
         m3.metric("Juros acumulados (todos)", f"R$ {total_juros:,.2f}")
 
-        st.download_button(
-            "⬇️ Baixar planilha atual",
-            data=open(ARQUIVO_EXCEL, "rb").read() if os.path.exists(ARQUIVO_EXCEL) else b"",
-            file_name=ARQUIVO_EXCEL,
-            disabled=not os.path.exists(ARQUIVO_EXCEL),
-        )
+        st.divider()
+        st.subheader("☁️ Status & Backup dos Dados")
+        worksheet, msg_status = conectar_worksheet_gsheets()
+        if worksheet is not None:
+            url_planilha = getattr(worksheet.spreadsheet, "url", "#")
+            st.success(f"✔️ Conectado ao Google Sheets: **{worksheet.spreadsheet.title}** (Aba: `{worksheet.title}`)")
+            if url_planilha != "#":
+                st.markdown(f"🔗 [**Abrir Planilha no Google Sheets**]({url_planilha})")
+        else:
+            st.warning(f"☁️ Status do Google Sheets: {msg_status}")
+
+        col_b1, col_b2 = st.columns(2)
+        with col_b1:
+            csv_data = df.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "⬇️ Baixar backup em CSV",
+                data=csv_data,
+                file_name="emprestimos_gsheets_backup.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        with col_b2:
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                df.to_excel(writer, index=False, sheet_name=NOME_ABA_GSHEETS)
+            st.download_button(
+                "⬇️ Baixar backup em Excel (.xlsx)",
+                data=buffer.getvalue(),
+                file_name="emprestimos_gsheets_backup.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
 
         st.divider()
         st.subheader("🔎 Quanto falta receber, por quem emprestou")

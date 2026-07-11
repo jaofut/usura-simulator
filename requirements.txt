@@ -1,3 +1,6 @@
 streamlit
 pandas
 openpyxl
+gspread>=5.10.0
+google-auth>=2.20.0
+st-gsheets-connection

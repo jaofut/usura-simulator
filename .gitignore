@@ -1,0 +1,32 @@
+# Arquivos de chave e segredos (NUNCA envie ao GitHub!)
+credentials.json
+service_account.json
+gsheets_credentials.json
+*.json
+!credentials.example.json
+!package.json
+!tsconfig.json
+
+# Streamlit secrets
+.streamlit/secrets.toml
+.env
+
+# Planilhas temporárias e de backup local
+*.xlsx
+*.csv
+
+# Cache e artefatos Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Sistema operacional / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

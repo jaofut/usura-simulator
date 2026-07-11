@@ -1,6 +1,12 @@
 Esse sistema registra empréstimos (quem emprestou, quem recebeu, valor e taxa mensal),
-persiste tudo em um arquivo Excel e controla o saldo devedor com juros
-simples diários, derivados da própria taxa mensal informada.
+persiste tudo no **Google Sheets** na nuvem (com suporte a cache e backup local) e controla
+o saldo devedor com juros simples diários, derivados da própria taxa mensal informada.
+
+### Configuração do Google Sheets (`v01.py`):
+1. Crie ou utilize uma Conta de Serviço (Service Account) no Google Cloud Console com acesso à Google Sheets API.
+2. Salve o arquivo JSON de chaves baixado como **`credentials.json`** na pasta `usura simulator/` OU configure-o no arquivo `.streamlit/secrets.toml`.
+3. Crie uma planilha no Google Drive com o nome **`Gerenciador de Empréstimos - Usura Simulator`** e compartilhe-a dando permissão de **Editor** para o e-mail (`client_email`) da Service Account.
+*(Enquanto a conexão não for configurada, o sistema executará normalmente utilizando a memória temporária da sessão e permitindo exportar backups em CSV/XLSX).*
 
 Modelo de juros (importante para entender os cálculos abaixo):
 - Juros simples diários incidem sobre o SALDO DE CAPITAL em aberto, à
